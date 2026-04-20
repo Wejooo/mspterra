@@ -354,16 +354,18 @@
       retries: 30
       delay: 10
 
-    - name: Wait for Odoo HTTP endpoint to respond
-      ansible.builtin.uri:
-        url: "http://{{ lb_hostname }}/web/database/manager"
-        headers:
-          Host: "{{ odoo_host }}"
-        validate_certs: false
-        status_code: [200, 303]
+    - name: Wait for Odoo HTTPS endpoint to respond
+      ansible.builtin.shell:
+        cmd: >
+          curl -k -sS --connect-timeout 5
+          -H "Host: {{ odoo_host }}"
+          "https://{{ lb_hostname }}/web/database/manager"
+          -o /dev/null -w '%{http_code}'
       register: odoo_http
-      until: odoo_http.status is defined and odoo_http.status in [200, 303]
-      retries: 30
+      changed_when: false
+      failed_when: false
+      until: odoo_http.stdout in ['200', '303']
+      retries: 60
       delay: 10
 
     # ── Création automatique de la base Odoo ──────────────────────────────────
