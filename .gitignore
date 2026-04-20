@@ -1,0 +1,21 @@
+# Terraform state et cache
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+
+# Ansible retry files
+*.retry
+
+# Credentials AWS locales
+.aws/
+
+# Credentials générés par Ansible
+CREDENTIALS.txt
+/tmp/odoo-tls.*
+
+# Binaires téléchargés
+kubectl
+helm
+terraform_*.zip
+helm*.tar.gz

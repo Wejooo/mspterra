@@ -1,0 +1,456 @@
+---
+- name: Deploy Odoo on EKS (turnkey)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    odoo_namespace: "odoo"
+    ingress_namespace: "ingress-nginx"
+    odoo_host: "odoo.mspterra.local"
+    odoo_database: "odoo"
+    odoo_admin_email: "admin@mspterra.local"
+    odoo_admin_password: "Admin2024!"
+    odoo_master_password: "MSPTerraMaster2024!"
+    postgres_user: "odoo"
+    postgres_password: "Odoo2024!"
+    credentials_file: "{{ playbook_dir }}/../../CREDENTIALS.txt"
+
+  tasks:
+
+    # ── Storage: local-path-provisioner ──────────────────────────────────────
+    - name: Deploy local-path-provisioner
+      kubernetes.core.k8s:
+        state: present
+        src: "https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml"
+
+    - name: Set local-path as default StorageClass
+      kubernetes.core.k8s:
+        state: patched
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        name: local-path
+        definition:
+          metadata:
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+
+    # ── Ingress-nginx (via Helm) ──────────────────────────────────────────────
+    - name: Add ingress-nginx Helm repo
+      kubernetes.core.helm_repository:
+        name: ingress-nginx
+        repo_url: https://kubernetes.github.io/ingress-nginx
+
+    - name: Deploy ingress-nginx
+      kubernetes.core.helm:
+        name: ingress-nginx
+        chart_ref: ingress-nginx/ingress-nginx
+        release_namespace: "{{ ingress_namespace }}"
+        create_namespace: true
+        wait: true
+        wait_timeout: "300s"
+        values:
+          controller:
+            service:
+              type: LoadBalancer
+
+    - name: Wait for ingress-nginx LoadBalancer hostname
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        name: ingress-nginx-controller
+        namespace: "{{ ingress_namespace }}"
+      register: ingress_svc
+      until: >
+        ingress_svc.resources | length > 0 and
+        ingress_svc.resources[0].status.loadBalancer.ingress is defined and
+        ingress_svc.resources[0].status.loadBalancer.ingress | length > 0
+      retries: 30
+      delay: 15
+
+    - name: Set LoadBalancer hostname fact
+      ansible.builtin.set_fact:
+        lb_hostname: "{{ ingress_svc.resources[0].status.loadBalancer.ingress[0].hostname }}"
+
+    # ── Odoo namespace ────────────────────────────────────────────────────────
+    - name: Create odoo namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ odoo_namespace }}"
+
+    # ── PostgreSQL ────────────────────────────────────────────────────────────
+    - name: Deploy PostgreSQL Secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: postgres-secret
+            namespace: "{{ odoo_namespace }}"
+          type: Opaque
+          stringData:
+            POSTGRES_USER: "{{ postgres_user }}"
+            POSTGRES_PASSWORD: "{{ postgres_password }}"
+            POSTGRES_DB: postgres
+
+    - name: Deploy PostgreSQL PVC
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: postgres-pvc
+            namespace: "{{ odoo_namespace }}"
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: local-path
+            resources:
+              requests:
+                storage: 5Gi
+
+    - name: Deploy PostgreSQL
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: postgres
+            namespace: "{{ odoo_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgres
+            template:
+              metadata:
+                labels:
+                  app: postgres
+              spec:
+                containers:
+                  - name: postgres
+                    image: postgres:16
+                    envFrom:
+                      - secretRef:
+                          name: postgres-secret
+                    env:
+                      - name: PGDATA
+                        value: /var/lib/postgresql/data/pgdata
+                    volumeMounts:
+                      - name: data
+                        mountPath: /var/lib/postgresql/data
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: postgres-pvc
+
+    - name: Deploy PostgreSQL Service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgres
+            namespace: "{{ odoo_namespace }}"
+          spec:
+            selector:
+              app: postgres
+            ports:
+              - port: 5432
+                targetPort: 5432
+
+    - name: Wait for PostgreSQL to be ready
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ odoo_namespace }}"
+        label_selectors:
+          - app=postgres
+      register: pg_pods
+      until: >
+        pg_pods.resources | length > 0 and
+        pg_pods.resources[0].status.containerStatuses is defined and
+        pg_pods.resources[0].status.containerStatuses[0].ready
+      retries: 30
+      delay: 5
+
+    # ── Odoo Config (master_passwd fixé) ──────────────────────────────────────
+    - name: Create Odoo ConfigMap (odoo.conf)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: odoo-config
+            namespace: "{{ odoo_namespace }}"
+          data:
+            odoo.conf: |
+              [options]
+              admin_passwd = {{ odoo_master_password }}
+              db_host = postgres
+              db_port = 5432
+              db_user = {{ postgres_user }}
+              db_password = {{ postgres_password }}
+              list_db = True
+              proxy_mode = True
+              logfile = False
+
+    - name: Deploy Odoo PVC
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: odoo-data
+            namespace: "{{ odoo_namespace }}"
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: local-path
+            resources:
+              requests:
+                storage: 5Gi
+
+    - name: Deploy Odoo
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: odoo
+            namespace: "{{ odoo_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: odoo
+            template:
+              metadata:
+                labels:
+                  app: odoo
+              spec:
+                containers:
+                  - name: odoo
+                    image: odoo:17
+                    ports:
+                      - containerPort: 8069
+                    volumeMounts:
+                      - name: data
+                        mountPath: /var/lib/odoo
+                      - name: config
+                        mountPath: /etc/odoo/odoo.conf
+                        subPath: odoo.conf
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: odoo-data
+                  - name: config
+                    configMap:
+                      name: odoo-config
+
+    - name: Deploy Odoo Service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: odoo
+            namespace: "{{ odoo_namespace }}"
+          spec:
+            selector:
+              app: odoo
+            ports:
+              - port: 80
+                targetPort: 8069
+
+    # ── TLS self-signed + Ingress ─────────────────────────────────────────────
+    - name: Generate self-signed TLS certificate
+      ansible.builtin.command:
+        cmd: >
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048
+          -keyout /tmp/odoo-tls.key
+          -out /tmp/odoo-tls.crt
+          -subj "/CN={{ odoo_host }}/O=MSPTERRA"
+      args:
+        creates: /tmp/odoo-tls.crt
+
+    - name: Read TLS cert
+      ansible.builtin.slurp:
+        src: /tmp/odoo-tls.crt
+      register: tls_crt
+
+    - name: Read TLS key
+      ansible.builtin.slurp:
+        src: /tmp/odoo-tls.key
+      register: tls_key
+
+    - name: Create TLS Secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: odoo-tls
+            namespace: "{{ odoo_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ tls_crt.content }}"
+            tls.key: "{{ tls_key.content }}"
+
+    - name: Deploy Ingress
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: odoo
+            namespace: "{{ odoo_namespace }}"
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+              nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+          spec:
+            ingressClassName: nginx
+            tls:
+              - hosts:
+                  - "{{ odoo_host }}"
+                secretName: odoo-tls
+            rules:
+              - host: "{{ odoo_host }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: odoo
+                          port:
+                            number: 80
+
+    # ── Attente du démarrage Odoo ─────────────────────────────────────────────
+    - name: Wait for Odoo pod to be ready
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ odoo_namespace }}"
+        label_selectors:
+          - app=odoo
+      register: odoo_pods
+      until: >
+        odoo_pods.resources | length > 0 and
+        odoo_pods.resources[0].status.containerStatuses is defined and
+        odoo_pods.resources[0].status.containerStatuses[0].ready
+      retries: 30
+      delay: 10
+
+    - name: Wait for Odoo HTTP endpoint to respond
+      ansible.builtin.uri:
+        url: "http://{{ lb_hostname }}/web/database/manager"
+        headers:
+          Host: "{{ odoo_host }}"
+        validate_certs: false
+        status_code: [200, 303]
+      register: odoo_http
+      until: odoo_http.status is defined and odoo_http.status in [200, 303]
+      retries: 30
+      delay: 10
+
+    # ── Création automatique de la base Odoo ──────────────────────────────────
+    - name: Check if Odoo database already exists
+      ansible.builtin.shell:
+        cmd: >
+          kubectl exec -n {{ odoo_namespace }} deployment/postgres --
+          psql -U {{ postgres_user }} -d postgres -tAc
+          "SELECT 1 FROM pg_database WHERE datname='{{ odoo_database }}'"
+      register: db_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create Odoo database (initial setup)
+      ansible.builtin.uri:
+        url: "https://{{ lb_hostname }}/web/database/create"
+        method: POST
+        headers:
+          Host: "{{ odoo_host }}"
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          master_pwd: "{{ odoo_master_password }}"
+          name: "{{ odoo_database }}"
+          login: "{{ odoo_admin_email }}"
+          password: "{{ odoo_admin_password }}"
+          phone: ""
+          lang: "en_US"
+          country_code: "fr"
+          demo: "False"
+        follow_redirects: none
+        status_code: [200, 303]
+        timeout: 300
+      when: db_check.stdout | trim != '1'
+      register: db_create
+
+    # ── Export des credentials dans un fichier ────────────────────────────────
+    - name: Write credentials file
+      ansible.builtin.copy:
+        dest: "{{ credentials_file }}"
+        mode: '0600'
+        content: |
+          ============================================================
+          MSPR TPRE961 - Odoo sur EKS AWS - Credentials
+          Généré le : {{ ansible_date_time.iso8601 }}
+          ============================================================
+
+          ── ACCES ODOO ──────────────────────────────────────────────
+          URL                 : https://{{ odoo_host }}
+          LoadBalancer        : {{ lb_hostname }}
+
+          ── BASE DE DONNEES ODOO ────────────────────────────────────
+          Database name       : {{ odoo_database }}
+          Admin email         : {{ odoo_admin_email }}
+          Admin password      : {{ odoo_admin_password }}
+
+          Master password     : {{ odoo_master_password }}
+          (utilisé pour créer/supprimer/dupliquer une base Odoo)
+
+          ── POSTGRESQL (interne au cluster) ─────────────────────────
+          Host                : postgres.{{ odoo_namespace }}.svc.cluster.local
+          Port                : 5432
+          User                : {{ postgres_user }}
+          Password            : {{ postgres_password }}
+
+          ── ACCES NAVIGATEUR ────────────────────────────────────────
+          Ajoutez dans C:\Windows\System32\drivers\etc\hosts (admin) :
+
+             <IP_LB>  {{ odoo_host }}
+
+          Pour récupérer l'IP publique du LoadBalancer :
+             nslookup {{ lb_hostname }}
+
+          ── INFRASTRUCTURE ──────────────────────────────────────────
+          Cluster EKS         : mspterra-eks (us-east-1)
+          Workers             : 2 x t3.medium (Amazon Linux 2023)
+          Ingress             : ingress-nginx (LB AWS NLB)
+          Storage             : local-path-provisioner
+          TLS                 : auto-signé (validité 365 jours)
+          ============================================================
+
+    - name: Show final access info
+      ansible.builtin.debug:
+        msg:
+          - "=== Déploiement Odoo terminé ==="
+          - "URL        : https://{{ odoo_host }}"
+          - "Email      : {{ odoo_admin_email }}"
+          - "Password   : {{ odoo_admin_password }}"
+          - "Credentials: {{ credentials_file | realpath }}"
+          - "IP LB      : nslookup {{ lb_hostname }}"
